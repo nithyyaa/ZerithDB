@@ -1,8 +1,14 @@
-import type { ZerithDBConfig } from "zerithdb-core";
-import { DbClient, CollectionClient } from "./db-client.js";
-import { SyncEngine } from "./sync-engine.js";
-import { AuthManager } from "./auth-manager.js";
-import { NetworkManager } from "./network-manager.js";
+import { Logger } from "zerithdb-core";
+import type { Document, Identity, QueryFilter, SyncState, ZerithDBConfig } from "zerithdb-core";
+export type { Document, Identity, QueryFilter, SyncState, ZerithDBConfig };
+import { MemoryCollector, estimateStorageBytes } from "zerithdb-devtools";
+import { ZerithDBError, ErrorCode } from "zerithdb-core";
+import { DbClient, CollectionClient } from "zerithdb-db";
+import type { CloudBackupTarget, LocalCloudBackupOptions } from "zerithdb-db";
+import { LocalCloudBackupAdapter } from "zerithdb-db";
+import { SyncEngine } from "zerithdb-sync";
+import { AuthManager } from "zerithdb-auth";
+import { NetworkManager } from "zerithdb-network";
 
 /**
  * The root ZerithDB application instance returned by {@link createApp}.
@@ -33,6 +39,12 @@ export interface ZerithDBApp {
   /** P2P network manager — WebRTC peer connections and signaling */
   network: NetworkManager;
 
+  /**
+   * Create a local cloud backup adapter. The adapter exports configured
+   * IndexedDB collections and uploads the JSON snapshot through the target.
+   */
+  backup(target: CloudBackupTarget, options?: LocalCloudBackupOptions): LocalCloudBackupAdapter;
+
   /** Underlying app configuration */
   config: Readonly<ZerithDBConfig>;
 
@@ -59,19 +71,44 @@ export interface ZerithDBApp {
  * const app = createApp({
  *   appId: "my-todo-app",
  *   sync: { signalingUrl: "wss://signal.zerithdb.dev" },
+ *   debug: { devtools: true },
  * });
  *
  * await app.db("todos").insert({ text: "Ship ZerithDB v1", done: false });
  * app.sync.enable();
  * ```
  */
+
+function isIndexedDBAvailable(): boolean {
+  try {
+    return typeof indexedDB !== "undefined";
+  } catch {
+    return false;
+  }
+}
+
 export function createApp(config: ZerithDBConfig): ZerithDBApp {
+  if (!isIndexedDBAvailable()) {
+    throw new ZerithDBError(
+      ErrorCode.SDK_NOT_INITIALIZED,
+      "IndexedDB is unavailable in this browser environment. ZerithDB requires IndexedDB support. Try disabling private/incognito restrictions or use a supported browser."
+    );
+  }
+
+  if (!config.appId || config.appId.trim().length === 0) {
+    throw new ZerithDBError(
+      ErrorCode.SDK_INVALID_CONFIG,
+      'createApp requires a non-empty "appId" in config'
+    );
+  }
+
   const resolvedConfig: ZerithDBConfig = {
     logLevel: "warn",
     ...config,
     sync: {
       signalingUrl: "wss://signal.zerithdb.dev",
       maxPeers: 10,
+      transport: "auto",
       ...config.sync,
     },
     auth: {
@@ -85,29 +122,58 @@ export function createApp(config: ZerithDBConfig): ZerithDBApp {
     },
   };
 
+  const logger = new Logger(resolvedConfig, "SDK");
+  logger.info("Initializing ZerithDB app", { appId: resolvedConfig.appId });
+
   const auth = new AuthManager(resolvedConfig);
   const db = new DbClient(resolvedConfig);
   const network = new NetworkManager(resolvedConfig, auth);
   const sync = new SyncEngine(resolvedConfig, db, network);
 
-  const collectionCache = new Map<string, CollectionClient<any>>();
+  let memoryCollector: MemoryCollector | null = null;
+  if (resolvedConfig.debug?.devtools === true) {
+    memoryCollector = new MemoryCollector({
+      measureIndexedDB: async () => {
+        const [totalBytes, dbStats] = await Promise.all([
+          estimateStorageBytes(),
+          db.getMemoryStats(),
+        ]);
+        return {
+          totalBytes,
+          recordCount: dbStats.recordCount,
+          collections: dbStats.collections,
+        };
+      },
+      measureWebRTC: () => network.getBufferStats(),
+    });
+    memoryCollector.start();
+  }
+
+  const backupAdapters = new Set<LocalCloudBackupAdapter>();
 
   return {
     config: Object.freeze(resolvedConfig),
 
     db<T extends Record<string, any>>(name: string): CollectionClient<T> {
-      if (!collectionCache.has(name)) {
-        collectionCache.set(name, db.collection(name));
-      }
-      // biome-ignore lint: cache guarantees this is defined
-      return collectionCache.get(name) as CollectionClient<T>;
+      // DbClient already caches collection instances internally —
+      // no need for a second cache layer here.
+      return db.collection<T>(name);
     },
 
     sync,
     auth,
     network,
 
+    backup(target: CloudBackupTarget, options?: LocalCloudBackupOptions): LocalCloudBackupAdapter {
+      const adapter = new LocalCloudBackupAdapter(db, target, options);
+      backupAdapters.add(adapter);
+      return adapter;
+    },
+
     async dispose(): Promise<void> {
+      memoryCollector?.stop();
+      await Promise.all(Array.from(backupAdapters).map((a) => a.stop()));
+      backupAdapters.clear();
       await Promise.all([sync.dispose(), network.dispose(), db.dispose()]);
     },
   };

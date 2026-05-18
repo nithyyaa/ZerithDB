@@ -20,6 +20,8 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
   private readonly docs = new Map<string, Y.Doc>();
   private readonly persistences = new Map<string, IndexeddbPersistence>();
   private _enabled = false;
+  private readonly pendingUpdates = new Map<string, Uint8Array[]>();
+  private readonly throttleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private _state: SyncState = { synced: false, pendingUpdates: 0, connectedPeers: 0 };
 
   constructor(
@@ -74,16 +76,41 @@ export class SyncEngine extends EventEmitter<SyncEvents> {
     this.persistences.set(collectionName, persistence);
 
     // Broadcast local updates to peers
-    doc.on("update", (update: Uint8Array, origin: unknown) => {
-      if (origin === "remote") return; // Don't echo back remote updates
-      if (!this._enabled) return;
+ // Broadcast local updates to peers
+doc.on("update", (update: Uint8Array, origin: unknown) => {
+  if (origin === "remote") return; // Don't echo back remote updates
+  if (!this._enabled) return;
 
-      this.emit("update:local", { collectionName, update });
+  this.emit("update:local", { collectionName, update });
+
+  const updates = this.pendingUpdates.get(collectionName) ?? [];
+  updates.push(update);
+  this.pendingUpdates.set(collectionName, updates);
+
+  if (this.throttleTimers.has(collectionName)) return;
+
+  const delay = this.config.sync?.updateThrottleMs ?? 100;
+
+  const timer = setTimeout(() => {
+    const queuedUpdates =
+      this.pendingUpdates.get(collectionName) ?? [];
+
+    for (const queuedUpdate of queuedUpdates) {
       this.network.broadcast({
         type: "sync-update",
-        payload: this.encodeMessage(collectionName, update),
+        payload: this.encodeMessage(
+          collectionName,
+          queuedUpdate
+        ),
       });
-    });
+    }
+
+    this.pendingUpdates.delete(collectionName);
+    this.throttleTimers.delete(collectionName);
+  }, delay);
+
+  this.throttleTimers.set(collectionName, timer);
+});
 
     this.docs.set(collectionName, doc);
     return doc;

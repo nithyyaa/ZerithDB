@@ -17,6 +17,12 @@ export interface SyncConfig {
    * @default 10
    */
   maxPeers?: number;
+  /**
+ * Delay between sync broadcasts in ms.
+ * Helps batch rapid Yjs updates together.
+ * @default 100
+ */
+  updateThrottleMs?: number;
 }
 
 export interface AuthConfig {
